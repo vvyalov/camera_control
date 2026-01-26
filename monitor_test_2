@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+КАМЕРА МОНИТОР - финальная версия
+Показывает статус камеры Blackmagic в реальном времени
+"""
+
+import asyncio
+import sys
+from datetime import datetime
+from bleak import BleakClient
+from pathlib import Path
+import json
+
+from protocol import parse_bmpcc_message
+from protocol.constants import (
+    UUID_NOTIFICATIONS, UUID_TELEMETRY, UUID_STATUS,
+    CATEGORY_EXPOSURE, CATEGORY_CAMERA, CATEGORY_LENS, CATEGORY_COMMANDS,
+    SUBCAT_SHUTTER, SUBCAT_APERTURE, SUBCAT_ISO_HIGH, 
+    SUBCAT_LENS_NAME, SUBCAT_RECORDING_STATUS
+)
+
+# ================= КОНФИГУРАЦИЯ =================
+CAMERA_ADDRESS = "E7D0FD32-5393-2B54-61EE-F21174E0D7B0"
+# ================================================
+
+class CameraMonitor:
+    """Монитор статуса камеры"""
+    
+    def __init__(self):
+        self.iso = "—"
+        self.shutter = "—"
+        self.aperture = "—"
+        self.recording = False
+        self.lens_name = "—"
+        self.battery = "—"
+        self.last_update = None
+        self.message_count = 0
+        
+    def update_from_message(self, parsed: dict):
+        """Обновляет статус из распаршенного сообщения"""
+        if parsed["type"] != "bmpcc_message":
+            return
+        
+        category = parsed["category"]
+        subcategory = parsed["subcategory"]
+        value = parsed["value_human"]
+        
+        # Обновляем соответствующие поля
+        if category == CATEGORY_EXPOSURE:
+            if subcategory == SUBCAT_SHUTTER and "1/" in value:
+                self.shutter = value
+            elif subcategory == SUBCAT_APERTURE and "f/" in value:
+                self.aperture = value
+                
+        elif category == CATEGORY_CAMERA:
+            if subcategory == SUBCAT_ISO_HIGH and "ISO" in value:
+                self.iso = value
+                
+        elif category == CATEGORY_LENS:
+            if subcategory == SUBCAT_LENS_NAME:
+                self.lens_name = value
+                
+        elif category == CATEGORY_COMMANDS:
+            if subcategory == SUBCAT_RECORDING_STATUS:
+                if "Запись 🔴" in value:
+                    self.recording = True
+                else:
+                    self.recording = False
+        
+        self.last_update = parsed.get("timestamp", "")
+        self.message_count += 1
+        
+        # Показываем обновлённый статус каждые 5 сообщений
+        if self.message_count % 5 == 0:
+            self.display_status()
+    
+    def display_status(self):
+        """Выводит текущий статус камеры"""
+        import os
+        os.system('clear' if os.name == 'posix' else 'cls')
+        
+        print("=" * 50)
+        print("📷 BLACKMAGIC POCKET CINEMA CAMERA 6K")
+        print("=" * 50)
+        
+        print(f"\n📊 СТАТУС КАМЕРЫ:")
+        print(f"   ISO:        {self.iso:>10}")
+        print(f"   Выдержка:   {self.shutter:>10}")
+        print(f"   Диафрагма:  {self.aperture:>10}")
+        print(f"   Объектив:   {self.lens_name:>10}")
+        
+        if self.recording:
+            print(f"\n   🎥 ЗАПИСЬ:    {'ВКЛ 🔴':>10}")
+        else:
+            print(f"\n   🎥 ЗАПИСЬ:    {'ВЫКЛ':>10}")
+            
+        if self.battery != "—":
+            print(f"   🔋 Батарея:   {self.battery:>10}%")
+            
+        if self.last_update:
+            print(f"\n   ⏰ Обновлено: {self.last_update}")
+            
+        print(f"\n   📨 Сообщений: {self.message_count}")
+        print("\n" + "=" * 50)
+        print("Для остановки нажмите Ctrl+C")
+        print("=" * 50)
+
+async def main():
+    """Основная функция"""
+    monitor = CameraMonitor()
+    
+    print("=" * 60)
+    print("📡 BLACKMAGIC CAMERA MONITOR v1.0")
+    print("=" * 60)
+    print(f"Камера: {CAMERA_ADDRESS}")
+    print(f"Время: {datetime.now().strftime('%H:%M:%S')}")
+    print("=" * 60)
+    print("\n🔗 Подключаюсь к камере...")
+    
+    try:
+        async with BleakClient(
+            CAMERA_ADDRESS, 
+            timeout=15.0,
+            pair_before_connect=False
+        ) as client:
+            print("✅ Подключено!")
+            
+            # Начальный вывод
+            monitor.display_status()
+            
+            def handle_notification(sender, data):
+                """Обработчик уведомлений"""
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                parsed = parse_bmpcc_message(data)
+                parsed["timestamp"] = timestamp
+                
+                # Обновляем монитор
+                monitor.update_from_message(parsed)
+            
+            # Подписываемся на уведомления
+            await client.start_notify(UUID_NOTIFICATIONS, handle_notification)
+            
+            print("\n🎬 МОНИТОРИНГ АКТИВЕН...")
+            print("Измените настройки на камере чтобы увидеть обновления")
+            
+            # Бесконечный цикл мониторинга
+            try:
+                while True:
+                    await asyncio.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\n\n⏹️ Остановлено пользователем")
+                
+            # Отписываемся
+            await client.stop_notify(UUID_NOTIFICATIONS)
+            
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        return False
+    
+    print("\n" + "=" * 60)
+    print("📈 СТАТИСТИКА:")
+    print(f"   Получено сообщений: {monitor.message_count}")
+    print("=" * 60)
+    
+    return True
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)
+    
+    try:
+        success = asyncio.run(main())
+        if success:
+            print("\n✅ Мониторинг завершён успешно!")
+        else:
+            print("\n❌ Мониторинг завершён с ошибкой")
+    except KeyboardInterrupt:
+        print("\n\n⏹️ Остановлено пользователем")
