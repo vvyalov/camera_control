@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+🔍 BLACKMAGIC PROTOCOL DEBUGGER v2.0
+Логгирует ВСЕ сообщения от камеры для анализа протокола
+Использует исправленный протокол с разделением на ОСНОВНЫЕ/СЫРЫЕ данные
+"""
+
+import os
+import sys
+
+# ================= КРИТИЧЕСКИ ВАЖНО =================
+# Добавляем путь к проекту для импорта protocols
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+# ====================================================
+
+import asyncio
+from datetime import datetime
+from collections import defaultdict
+from bleak import BleakClient
+
+# ================= ИСПРАВЛЕННЫЕ ИМПОРТЫ =================
+from protocols.bm import parse_bmpcc_message
+from protocols.bm.parser import format_message_for_log
+from protocols.bm.constants import UUID_NOTIFICATIONS, UUID_TELEMETRY
+# =======================================================
+
+# ================= КОНФИГУРАЦИЯ =================
+# Получаем адрес камеры из аргументов
+if len(sys.argv) > 1:
+    CAMERA_ADDRESS = sys.argv[1]
+elif os.path.exists("selected_camera.txt"):
+    with open("selected_camera.txt", "r") as f:
+        CAMERA_ADDRESS = f.read().strip()
+else:
+    print("❌ Адрес камеры не указан!")
+    print("Использование: python3 unified_monitor.py <адрес_камеры>")
+    sys.exit(1)
+
+LOG_FILE = "camera_debug.log"
+# ================================================
+
+class DebugMonitor:
+    """Отладочный монитор протокола камеры"""
+    
+    def __init__(self):
+        self.message_count = 0
+        self.start_time = datetime.now()
+        self.logging_active = True
+        
+        # Статистика с учётом типов данных
+        self.stats = {
+            'total': 0,
+            'primary': 0,      # Основные параметры (✅)
+            'raw': 0,          # Сырые данные (📊)
+            'other': 0,        # Остальное (📡)
+            'errors': 0,
+            'by_category': defaultdict(int),
+            'by_type': defaultdict(int),
+        }
+        
+        # Последние значения для основных параметров
+        self.last_values = {
+            'shutter': None,
+            'aperture': None,
+            'iso': None,
+            'recording': None,
+            'zoom': None,
+            'focus': None,
+        }
+        
+        # Открываем лог-файл
+        self.log_file = open(LOG_FILE, 'a', encoding='utf-8')
+        self._write_header()
+    
+    def _write_header(self):
+        """Записывает заголовок в лог-файл"""
+        self.log_file.write(f"\n{'='*80}\n")
+        self.log_file.write(f"BLACKMAGIC DEBUG SESSION v2.0\n")
+        self.log_file.write(f"Время начала: {self.start_time}\n")
+        self.log_file.write(f"Камера: {CAMERA_ADDRESS}\n")
+        self.log_file.write(f"{'='*80}\n\n")
+        self.log_file.write("ПРЕФИКСЫ:\n")
+        self.log_file.write("  ✅ - Основные параметры (выдержка, диафрагма, ISO, статус записи)\n")
+        self.log_file.write("  📊 - Сырые данные (00:xx, 09:xx) - НЕ для отображения в мониторе\n")
+        self.log_file.write("  📡 - Остальные параметры\n")
+        self.log_file.write("  ❓ - Неизвестные/ошибочные данные\n")
+        self.log_file.write("  🔧 - Служебные сообщения\n")
+        self.log_file.write(f"{'='*80}\n\n")
+        self.log_file.flush()
+    
+    def process_message(self, parsed: dict, raw_data: bytes):
+        """Обрабатывает и логирует сообщение"""
+        self.message_count += 1
+        self.stats['total'] += 1
+        
+        # Время с миллисекундами
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
+        msg_type = parsed.get("type", "unknown")
+        self.stats['by_type'][msg_type] += 1
+        
+        # Собираем статистику по категориям
+        if msg_type == "bmpcc_message":
+            category = parsed.get("category", 0)
+            cat_key = f"{category:02X}"
+            self.stats['by_category'][cat_key] += 1
+            
+            # Обновляем статистику по типам данных
+            if parsed.get("is_primary", False):
+                self.stats['primary'] += 1
+                prefix = "✅"
+            elif parsed.get("is_raw", False):
+                self.stats['raw'] += 1
+                prefix = "📊"
+            else:
+                self.stats['other'] += 1
+                prefix = "📡"
+            
+            # Обновляем последние значения основных параметров
+            self._update_last_values(parsed)
+            
+        elif msg_type == "status":
+            prefix = "🔧"
+        elif msg_type == "error":
+            prefix = "❓"
+            self.stats['errors'] += 1
+        else:
+            prefix = "❓"
+        
+        # Форматируем строку для вывода
+        if msg_type == "bmpcc_message":
+            output_line = format_message_for_log(parsed)
+            raw_hex = raw_data.hex().upper()
+            output_line = f"{output_line} | HEX: {raw_hex}"
+            # Добавляем timestamp к отформатированной строке
+            if output_line.startswith(("✅", "📊", "📡")):
+                output_line = f"[{timestamp}] {output_line}"
+        else:
+            raw_hex = raw_data.hex().upper()
+            value = parsed.get('value_human', parsed.get('data', ''))
+            output_line = f"[{timestamp}] {prefix} {msg_type}: {value} | HEX: {raw_hex}"
+        
+        # Всегда пишем в файл
+        self.log_file.write(output_line + "\n")
+        self.log_file.flush()
+        
+        # Выводим в консоль если активно
+        if self.logging_active:
+            print(output_line)
+            
+            # Показываем состояние каждые 50 сообщений
+            if self.message_count % 50 == 0:
+                self._show_current_state(timestamp)
+    
+    def _update_last_values(self, parsed: dict):
+        """Обновляет последние значения основных параметров"""
+        if not parsed.get("is_primary", False):
+            return
+        
+        category = parsed.get("category", 0)
+        subcategory = parsed.get("subcategory", 0)
+        value = parsed.get("value_human", "")
+        
+        # Выдержка (01:0C)
+        if category == 0x01 and subcategory == 0x0C:
+            self.last_values['shutter'] = value
+        
+        # Диафрагма (0C:0A)
+        elif category == 0x0C and subcategory == 0x0A:
+            # Очищаем значение
+            clean = value.replace("Диафрагма: ", "")
+            if clean.startswith("f") and "/" not in clean:
+                clean = f"f/{clean[1:]}"
+            self.last_values['aperture'] = clean
+        
+        # ISO (01:0E)
+        elif category == 0x01 and subcategory == 0x0E:
+            self.last_values['iso'] = value
+        
+        # Статус записи (0A:01)
+        elif category == 0x0A and subcategory == 0x01:
+            self.last_values['recording'] = value
+        
+        # Зум (0C:0B)
+        elif category == 0x0C and subcategory == 0x0B:
+            clean = value.replace("Зум: ", "") if "Зум: " in value else value
+            self.last_values['zoom'] = clean
+        
+        # Фокус (0C:0C)
+        elif category == 0x0C and subcategory == 0x0C:
+            clean = value.replace("Фокус: ", "") if "Фокус: " in value else value
+            self.last_values['focus'] = clean
+    
+    def _show_current_state(self, timestamp: str):
+        """Показывает текущее состояние основных параметров"""
+        print(f"\n{'─'*60}")
+        print(f"📊 ТЕКУЩЕЕ СОСТОЯНИЕ [{timestamp}]:")
+        print(f"{'─'*60}")
+        
+        params = [
+            ("Выдержка", self.last_values['shutter']),
+            ("Диафрагма", self.last_values['aperture']),
+            ("ISO", self.last_values['iso']),
+            ("Запись", self.last_values['recording']),
+            ("Зум", self.last_values['zoom']),
+            ("Фокус", self.last_values['focus']),
+        ]
+        
+        for name, value in params:
+            if value:
+                print(f"  {name:10} {value}")
+            else:
+                print(f"  {name:10} —")
+        
+        print(f"{'─'*60}")
+        print(f"  Всего сообщений: {self.message_count}")
+        print(f"  Основных: {self.stats['primary']}, Сырых: {self.stats['raw']}")
+        print(f"{'─'*60}\n")
+    
+    def toggle_logging(self):
+        """Включает/выключает вывод в консоль"""
+        self.logging_active = not self.logging_active
+        status = "ВКЛЮЧЕН" if self.logging_active else "ВЫКЛЮЧЕН"
+        print(f"\n📢 Консольный вывод {status}")
+        return self.logging_active
+    
+    def show_detailed_stats(self):
+        """Показывает детальную статистику"""
+        duration = datetime.now() - self.start_time
+        
+        print(f"\n{'='*80}")
+        print("📊 ПОДРОБНАЯ СТАТИСТИКА СЕССИИ")
+        print(f"{'='*80}")
+        print(f"Общее время: {duration}")
+        print(f"Всего сообщений: {self.stats['total']}")
+        print(f"  ✅ Основных параметров: {self.stats['primary']}")
+        print(f"  📊 Сырых данных: {self.stats['raw']}")
+        print(f"  📡 Остальных: {self.stats['other']}")
+        print(f"  ❓ Ошибок: {self.stats['errors']}")
+        
+        # Текущие значения
+        print(f"\n🎯 ТЕКУЩИЕ ЗНАЧЕНИЯ:")
+        for name, value in self.last_values.items():
+            if value:
+                print(f"  {name.capitalize():10}: {value}")
+        
+        # Категории
+        print(f"\n📈 СТАТИСТИКА ПО КАТЕГОРИЯМ:")
+        for cat, count in sorted(self.stats['by_category'].items()):
+            cat_name = {
+                '00': 'ФИЗИЧЕСКИЕ (сырые)',
+                '01': 'КАМЕРА (основные)',
+                '09': 'ТЕЛЕМЕТРИЯ (сырые)',
+                '0A': 'КОМАНДЫ',
+                '0C': 'ОБЪЕКТИВ (основные)',
+            }.get(cat, f"Категория {cat}")
+            print(f"  {cat}: {cat_name:25} - {count:4} сообщений")
+        
+        # Типы сообщений
+        print(f"\n🔧 ТИПЫ СООБЩЕНИЙ:")
+        for msg_type, count in sorted(self.stats['by_type'].items()):
+            print(f"  {msg_type:15}: {count:4}")
+        
+        print(f"{'='*80}")
+    
+    def close(self):
+        """Закрывает лог-файл и показывает итоги"""
+        end_time = datetime.now()
+        duration = end_time - self.start_time
+        
+        # Записываем итоги в лог
+        self.log_file.write(f"\n{'='*80}\n")
+        self.log_file.write(f"СЕССИЯ ЗАВЕРШЕНА\n")
+        self.log_file.write(f"Время окончания: {end_time}\n")
+        self.log_file.write(f"Длительность: {duration}\n")
+        self.log_file.write(f"Всего сообщений: {self.message_count}\n")
+        self.log_file.write(f"{'='*80}\n")
+        self.log_file.close()
+        
+        # Выводим итоги в консоль
+        print(f"\n{'='*80}")
+        print(f"📁 ЛОГ-ФАЙЛ СОХРАНЁН: {LOG_FILE}")
+        print(f"📊 Всего сообщений: {self.message_count}")
+        print(f"⏱️  Длительность: {duration}")
+        print(f"{'='*80}")
+
+# ================= ФАБРИКА ОБРАБОТЧИКОВ =================
+def create_notification_handler(monitor):
+    """Создает обработчик уведомлений с доступом к монитору"""
+    def handle_notification(sender, data):
+        try:
+            parsed = parse_bmpcc_message(data)
+            monitor.process_message(parsed, data)
+        except Exception as e:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            error_msg = f"[{timestamp}] ❓ Ошибка парсинга: {e} | HEX: {data.hex()}"
+            print(error_msg)
+            monitor.log_file.write(error_msg + "\n")
+            monitor.stats['errors'] += 1
+    
+    return handle_notification
+# ========================================================
+
+async def keyboard_handler(monitor):
+    """Обработчик клавиатуры для управления"""
+    print("\n" + "="*80)
+    print("🎮 УПРАВЛЕНИЕ ОТЛАДОЧНЫМ МОНИТОРОМ:")
+    print("  [p] - Пауза/продолжить вывод в консоль")
+    print("  [s] - Показать текущее состояние")
+    print("  [S] - Показать подробную статистику")
+    print("  [c] - Очистить экран")
+    print("  [q] - Выйти")
+    print("="*80)
+    print("\n🔍 Начинаю логгирование ВСЕХ сообщений...")
+    print("Изменяйте настройки на камере и наблюдайте за выводом")
+    print("="*80 + "\n")
+    
+    while True:
+        try:
+            await asyncio.sleep(0.1)
+            
+            if sys.platform == 'win32':
+                # Для Windows
+                import msvcrt
+                if msvcrt.kbhit():
+                    key = msvcrt.getch().decode('utf-8', errors='ignore').lower()
+                else:
+                    continue
+            else:
+                # Для Linux/macOS
+                import select
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    key = sys.stdin.read(1).lower()
+                else:
+                    continue
+            
+            if key == 'p':
+                monitor.toggle_logging()
+            elif key == 's':
+                monitor._show_current_state(datetime.now().strftime("%H:%M:%S.%f")[:-3])
+            elif key == 's' and key.isupper():
+                monitor.show_detailed_stats()
+            elif key == 'c':
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print("\n🧹 Экран очищен, продолжаю логгирование...\n")
+            elif key == 'q':
+                print("\n🚪 Завершение работы...")
+                return True
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка ввода: {e}")
+            continue
+
+async def main():
+    """Основная функция"""
+    monitor = DebugMonitor()
+    
+    print("="*80)
+    print("🔍 BLACKMAGIC DEBUG MONITOR v2.0")
+    print("="*80)
+    print("Использует исправленный протокол с разделением данных:")
+    print("  ✅ Основные параметры (выдержка, диафрагма, ISO, статус записи)")
+    print("  📊 Сырые данные (00:xx, 09:xx) - НЕ для отображения в мониторе")
+    print("  📡 Остальные параметры")
+    print("="*80)
+    print(f"Камера: {CAMERA_ADDRESS}")
+    print(f"Лог-файл: {LOG_FILE}")
+    print(f"Время запуска: {datetime.now().strftime('%H:%M:%S')}")
+    print("="*80)
+    
+    try:
+        async with BleakClient(
+            CAMERA_ADDRESS, 
+            timeout=20.0,
+            pair_before_connect=False
+        ) as client:
+            print("✅ Подключено к камере!")
+            
+            # Создаем обработчик с доступом к монитору
+            handle_notification = create_notification_handler(monitor)
+            
+            # Подписываемся на ОБА канала
+            await client.start_notify(UUID_NOTIFICATIONS, handle_notification)
+            await client.start_notify(UUID_TELEMETRY, handle_notification)
+            
+            # Запускаем обработчик клавиатуры
+            keyboard_task = asyncio.create_task(keyboard_handler(monitor))
+            
+            # Основной цикл
+            try:
+                await keyboard_task
+            except KeyboardInterrupt:
+                print("\n\n⏹️ Прервано пользователем (Ctrl+C)")
+            
+            # Отписываемся
+            await client.stop_notify(UUID_NOTIFICATIONS)
+            await client.stop_notify(UUID_TELEMETRY)
+            
+    except Exception as e:
+        print(f"\n❌ Ошибка подключения: {e}")
+        print("Проверьте:")
+        print("1. Камера включена и в режиме Bluetooth")
+        print("2. Камера рядом с компьютером")
+        print("3. Адрес камеры правильный")
+        monitor.close()
+        return False
+    
+    # Финальная статистика
+    monitor.show_detailed_stats()
+    monitor.close()
+    
+    return True
+
+if __name__ == "__main__":
+    # Настраиваем stdin для неблокирующего ввода
+    if sys.platform != 'win32':
+        import tty, termios
+        old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+    
+    try:
+        success = asyncio.run(main())
+        if success:
+            print("\n✅ Сессия завершена успешно!")
+        else:
+            print("\n❌ Сессия завершена с ошибка")
+    except KeyboardInterrupt:
+        print("\n\n⏹️ Прервано пользователем")
+    except Exception as e:
+        print(f"\n⚠️ Неожиданная ошибка: {e}")
+    finally:
+        # Восстанавливаем настройки терминала
+        if sys.platform != 'win32':
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
