@@ -1,5 +1,5 @@
 """
-Константы протокола Blackmagic BMPCC
+Константы протокола Blackmagic BMPCC v.0.1
 """
 
 # UUID каналов

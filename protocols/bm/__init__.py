@@ -1,5 +1,5 @@
 """
-Пакет protocol - работа с протоколом Blackmagic BMPCC
+Пакет protocol - работа с протоколом Blackmagic BMPCC v.0.1
 """
 
 from .parser import parse_bmpcc_message

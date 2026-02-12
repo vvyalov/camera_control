@@ -1,5 +1,5 @@
 """
-Парсер сырых сообщений Blackmagic BMPCC
+Парсер сырых сообщений Blackmagic BMPCC v.0.1
 """
 
 from . import constants, decoder
@@ -31,6 +31,22 @@ def parse_bmpcc_message(data: bytes) -> dict:
         
         category = payload[0]
         subcategory = payload[1]
+        
+        # СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ ТАЙМКОДА (0x09:0x04)
+        if category == 0x09 and subcategory == 0x04:
+            value = payload[4:] if len(payload) > 4 else b''
+            timecode_data = decoder.decode_timecode_bcd(value)
+            return {
+                "type": "bmpcc_message",
+                "category": category,
+                "subcategory": subcategory,
+                "timecode_data": timecode_data,
+                "value_human": f"TC: {timecode_data['hhmmssff']}",
+                "full_hex": data.hex(),
+                "is_primary": True,
+                "param_name": "Таймкод"
+            }
+        
         data_type = payload[2]
         subtype = payload[3]
         value = payload[4:] if len(payload) > 4 else b''
@@ -40,6 +56,19 @@ def parse_bmpcc_message(data: bytes) -> dict:
         
         # Декодируем значение
         human_value = decoder.decode_value(category, subcategory, value)
+        
+        # Определяем, является ли параметр основным
+        is_primary = (
+            (category == 0x01 and subcategory == 0x0C) or  # Выдержка
+            (category == 0x01 and subcategory == 0x0E) or  # ISO
+            (category == 0x0C and subcategory == 0x0A) or  # Диафрагма
+            (category == 0x0A and subcategory == 0x01) or  # Статус записи
+            (category == 0x0C and subcategory == 0x0B) or  # Зум
+            (category == 0x0C and subcategory == 0x0C)     # Фокус
+        )
+        
+        # Определяем, являются ли данные сырыми
+        is_raw = (category == 0x00 or category == 0x09)  # Экспозиция и Телеметрия
         
         return {
             "type": "bmpcc_message",
@@ -51,7 +80,9 @@ def parse_bmpcc_message(data: bytes) -> dict:
             "value_raw": value.hex(),
             "value_human": human_value,
             "full_hex": data.hex(),
-            "timestamp": ""  # Добавится позже при обработке
+            "timestamp": "",
+            "is_primary": is_primary,
+            "is_raw": is_raw
         }
     
     # Если не формат FF - это может быть простой статус (один байт)
@@ -81,13 +112,19 @@ def format_message_for_log(parsed: dict) -> str:
         subcat = parsed.get('subcategory', 0)
         value = parsed.get('value_human', '')
         
-        # Определяем префикс как в unified_monitor.py
+        # Определяем префикс
         if parsed.get('is_primary', False):
             prefix = "✅"
         elif parsed.get('is_raw', False):
             prefix = "📊"
         else:
             prefix = "📡"
+        
+        # Особый формат для таймкода
+        if cat == 0x09 and subcat == 0x04 and 'timecode_data' in parsed:
+            tc_data = parsed['timecode_data']
+            if isinstance(tc_data, dict) and 'hhmmssff' in tc_data:
+                return f"✅ [{cat:02X}:{subcat:02X}] TC: {tc_data['hhmmssff']}"
         
         return f"{prefix} [{cat:02X}:{subcat:02X}] {value}"
     

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-🎬 BLACKMAGIC CAMERA MONITOR v4.0
-Профессиональный двухколоночный layout
+🎬 BLACKMAGIC CAMERA MONITOR v0.1 - FIXED VERSION
+Профессиональный двухколоночный layout с исправленным таймкодом
 """
 
 import os
 import sys
+import time
 
 # ================= КРИТИЧЕСКИ ВАЖНО =================
 # Добавляем путь к проекту для импорта protocols
@@ -14,7 +15,7 @@ sys.path.insert(0, project_root)
 # ====================================================
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from bleak import BleakClient
 
 # Теперь импорты должны работать
@@ -37,44 +38,119 @@ REFRESH_RATE = 0.1  # 10 раз в секунду
 # ================================================
 
 class CameraMonitor:
-    """Монитор камеры с двухколоночным layout"""
+    """Монитор камеры с двухколоночным layout - ИСПРАВЛЕННЫЙ"""
     
     def __init__(self):
         # Основные значения
         self.values = {
-            'timecode': "—",        # CLIP TC (09:04)
-            'global_timecode': "—", # GLOBAL TC (из UUID_TELEMETRY)
-            'shutter': "—",
-            'aperture': "—",
-            'iso': "—",
-            'lens': "—",
-            'zoom': "—",
-            'focus': "—",
+            'timecode': "00:00:00:00",          # Основной отображаемый таймкод
+            'clip_timecode': "00:00:00:00",     # Таймкод клипа (сбрасывается при записи)
+            'free_run_timecode': "00:00:00:00", # Свободный таймкод (бежит всегда)
+            'global_timecode': "—",             # Глобальный таймкод из телеметрии
+            'fps': 25,                          # Частота кадров для таймкода
+            'last_tc_update': None,             # Время последнего обновления таймкода
+            
+            'shutter': "1/50",
+            'aperture': "f/2.8",
+            'iso': "ISO 400",
+            'lens': "Sigma 18-35mm",
+            'zoom': "18mm",
+            'focus': "2.8m",
         }
         
         # Блок записи
+        self.recording = False
         self.recording_status = "⚪"  # ⚪ или 🔴
         self.recording_duration = "00:00:00:00"
-        self.current_clip_start = None
+        self.record_start_time = None
+        self.last_frame_time = None
         
         # История клипов
-        self.clips = []  # Список строк в формате "HH:MM:SS:сс"
+        self.clips = []  # Список строк в формате "HH:MM:SS:FF"
         
         # Оставшееся время на диске
-        self.remaining_time = "00:00:00:00"
+        self.remaining_time = "01:23:45:00"
         
         # Статистика
         self.is_connected = False
         self.start_time = datetime.now()
         self.message_count = 0
+        self.last_tc_value = None
         
         # Отладка
         self.show_raw = False
+        self.debug_tc = True  # Для отладки таймкода
         self.paused = False
         
     def clear_screen(self):
         """Очищает экран"""
         os.system('cls' if os.name == 'nt' else 'clear')
+    
+    def increment_timecode(self, tc_str, frames_to_add=1):
+        """Инкрементирует таймкод на указанное количество кадров"""
+        try:
+            hh, mm, ss, ff = map(int, tc_str.split(':'))
+            
+            # Добавляем кадры
+            ff += frames_to_add
+            
+            # Обрабатываем переполнения
+            while ff >= self.values['fps']:
+                ff -= self.values['fps']
+                ss += 1
+            
+            while ss >= 60:
+                ss -= 60
+                mm += 1
+                
+            while mm >= 60:
+                mm -= 60
+                hh += 1
+                
+            while hh >= 24:
+                hh -= 24
+                
+            return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+        except:
+            return "00:00:00:00"
+    
+    def update_timecode(self):
+        """Обновляет таймкод на основе времени"""
+        now = datetime.now()
+        
+        # Если идет запись, обновляем клиповый таймкод
+        if self.recording:
+            if self.last_frame_time:
+                # Вычисляем сколько кадров прошло с последнего обновления
+                time_diff = (now - self.last_frame_time).total_seconds()
+                frames_to_add = int(time_diff * self.values['fps'])
+                
+                if frames_to_add > 0:
+                    self.values['clip_timecode'] = self.increment_timecode(
+                        self.values['clip_timecode'], frames_to_add
+                    )
+                    self.last_frame_time = now
+            else:
+                self.last_frame_time = now
+        
+        # Всегда обновляем свободный таймкод
+        if self.values['last_tc_update']:
+            time_diff = (now - self.values['last_tc_update']).total_seconds()
+            frames_to_add = int(time_diff * self.values['fps'])
+            
+            if frames_to_add > 0:
+                self.values['free_run_timecode'] = self.increment_timecode(
+                    self.values['free_run_timecode'], frames_to_add
+                )
+                self.values['last_tc_update'] = now
+        else:
+            self.values['last_tc_update'] = now
+        
+        # Выбираем какой таймкод показывать
+        if self.recording:
+            self.values['timecode'] = self.values['clip_timecode']
+        else:
+            self.values['timecode'] = self.values['free_run_timecode']
     
     def draw_header(self):
         """Рисует заголовок"""
@@ -84,7 +160,7 @@ class CameraMonitor:
         seconds = session_time.seconds % 60
         
         print("╔══════════════════════════════════════════════════════════════════════════╗")
-        print("║ 🎬 BLACKMAGIC CAMERA MONITOR v4.0".ljust(77) + "║")
+        print("║ 🎬 BLACKMAGIC CAMERA MONITOR v4.0 - FIXED".ljust(77) + "║")
         print("╠══════════════════════════════════════════════════════════════════════════╣")
         
         status = "✅ CONNECTED" if self.is_connected else "❌ DISCONNECTED"
@@ -95,43 +171,48 @@ class CameraMonitor:
     
     def draw_timecode_section(self):
         """Рисует секцию таймкода"""
-        # Отображаем оба таймкода
-        clip_tc = self.values['timecode']
-        global_tc = self.values['global_timecode']
+        tc = self.values['timecode']
+        fps = self.values['fps']
         
-        if clip_tc != "—" or global_tc != "—":
-            # Используем clip_tc как основной, если он есть
-            tc = clip_tc if clip_tc != "—" else global_tc
-            tc_type = "CLIP" if clip_tc != "—" else "GLOBAL"
-            
+        # Показываем прогресс дня для свободного таймкода
+        if not self.recording:
             try:
-                hh, mm, ss, cc = map(int, tc.split(':'))
-                day_percent = (hh * 3600 + mm * 60 + ss + cc/100) / 86400 * 100
+                hh, mm, ss, ff = map(int, tc.split(':'))
+                total_seconds = hh * 3600 + mm * 60 + ss + ff/fps
+                day_percent = (total_seconds / 86400) * 100
                 
-                bar_length = 15
+                bar_length = 20
                 filled = int(day_percent * bar_length / 100)
                 bar = "█" * filled + "░" * (bar_length - filled)
                 
-                print(f"  TC: {tc} [{bar}] {day_percent:.0f}%")
-                print(f"     ({tc_type} TIMECODE)")
+                print(f"  TC: {tc} [{bar}]")
+                print(f"     FPS: {fps}")
             except:
                 print(f"  TC: {tc}")
-                print(f"     ({tc_type} TIMECODE)")
+                print(f"     FPS: {fps}")
         else:
-            print("  TC: —")
+            # Для записи показываем клиповый таймкод
+            print(f"  CLIP TC: {tc} 🔴")
+            print(f"     FPS: {fps}")
     
     def draw_recording_section(self):
         """Рисует секцию записи"""
-        # Обновляем длительность если идет запись
-        if self.current_clip_start and self.recording_status == "🔴":
-            elapsed = datetime.now() - self.current_clip_start
+        if self.recording and self.record_start_time:
+            elapsed = datetime.now() - self.record_start_time
             hours = elapsed.seconds // 3600
             minutes = (elapsed.seconds % 3600) // 60
             seconds = elapsed.seconds % 60
-            hundredths = int(elapsed.microseconds / 10000)
-            self.recording_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}:{hundredths:02d}"
+            frames = int((elapsed.microseconds / 1000000) * self.values['fps'])
+            
+            self.recording_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
         
         print(f"  REC: {self.recording_status} {self.recording_duration}")
+        
+        # Показываем, какой таймкод сейчас активен
+        if self.recording:
+            print(f"     CLIP: {self.values['clip_timecode']}")
+        else:
+            print(f"     FREE: {self.values['free_run_timecode']}")
     
     def draw_clips_section(self):
         """Рисует секцию истории клипов"""
@@ -211,7 +292,7 @@ class CameraMonitor:
         # Подвал
         print()
         print("═" * 62)
-        print("Controls: [Q]uit [R]aw data [P]ause [C]lear [F]PS toggle")
+        print("Controls: [Q]uit [R]aw data [P]ause [C]lear [D]ebug TC")
         print("═" * 62)
     
     def handle_message(self, parsed_data, raw_data):
@@ -231,7 +312,14 @@ class CameraMonitor:
                     tc_type = parsed_data.get('is_global_tc', False)
                     source = "GLOBAL" if tc_type else "UNKNOWN"
                     print(f"[{source} TC] {tc_value}")
-            return  # ← ВЫХОДИМ, это не BMPCC сообщение
+            
+            # ОТЛАДКА
+            if self.debug_tc:
+                print(f"[DEBUG GLOBAL TC] Raw: {raw_data.hex()}")
+                print(f"[DEBUG GLOBAL TC] Parsed: {parsed_data}")
+                print("-" * 50)
+            
+            return
         
         # Статус (standalone сообщение)
         elif msg_type == 'status':
@@ -260,43 +348,87 @@ class CameraMonitor:
             try:
                 from protocols.bm.parser import format_message_for_log
                 log_line = format_message_for_log(parsed_data)
-                if "✅" in log_line or "09:04" in log_line or "0A:01" in log_line:
-                    print(log_line)
+                print(log_line)
             except ImportError:
                 pass
         
-        # Таймкод КЛИПА (09:04)
+        # ТАЙМКОД (09:04) - ГЛАВНОЕ ИСПРАВЛЕНИЕ
         if category == 0x09 and subcategory == 0x04:
+            if self.debug_tc:
+                print(f"[DEBUG TC 09:04] Raw: {raw_data.hex()}")
+                print(f"[DEBUG TC 09:04] Parsed: {parsed_data}")
+                print(f"[DEBUG TC 09:04] Current recording: {self.recording}")
+            
+            # Используем новый декодер BCD
             if 'timecode_data' in parsed_data:
                 tc_data = parsed_data['timecode_data']
                 if isinstance(tc_data, dict):
-                    self.values['timecode'] = tc_data.get('hhmmsscc', '—')
+                    # Берем готовую строку формата HH:MM:SS:FF
+                    tc_str = tc_data.get('hhmmssff', '00:00:00:00')
+                    
+                    if self.debug_tc:
+                        print(f"[DEBUG TC 09:04] Decoded: {tc_str}")
+                        print(f"[DEBUG TC 09:04] FPS: {tc_data.get('fps', '?')}")
+                        print("-" * 50)
+                    
+                    # Обновляем FPS если есть
+                    if 'fps' in tc_data:
+                        self.values['fps'] = tc_data['fps']
+                    
+                    # ВАЖНО: Обновляем время последнего получения таймкода
+                    self.values['last_tc_update'] = datetime.now()
+                    
+                    # Если идет запись - это клиповый таймкод
+                    if self.recording:
+                        self.values['clip_timecode'] = tc_str
+                        if self.debug_tc:
+                            print(f"[DEBUG] Updated clip_timecode to: {tc_str}")
+                    else:
+                        # Это свободный таймкод
+                        self.values['free_run_timecode'] = tc_str
+                        if self.debug_tc:
+                            print(f"[DEBUG] Updated free_run_timecode to: {tc_str}")
+                    
+                    # Сохраняем для отладки
+                    self.last_tc_value = tc_str
+            
+            elif self.show_raw:
+                print(f"[TC RAW] Value: {value_human}")
         
         # Статус записи (0A:01)
         elif category == 0x0A and subcategory == 0x01:
-            if "🔴" in value_human:
-                self.recording_status = "🔴"
-                if self.current_clip_start is None:
-                    self.current_clip_start = datetime.now()
-                    self.recording_duration = "00:00:00:00"
+            if "🔴" in value_human or "Запись" in value_human:
+                if not self.recording:  # Только если еще не записываем
+                    self.recording = True
+                    self.recording_status = "🔴"
+                    self.record_start_time = datetime.now()
+                    # Сбрасываем клиповый таймкод
+                    self.values['clip_timecode'] = "00:00:00:00"
+                    print(f"[INFO] Начало записи в {self.record_start_time.strftime('%H:%M:%S')}")
             else:
-                self.recording_status = "⚪"
-                if self.current_clip_start:
+                if self.recording:  # Только если записывали
+                    self.recording = False
+                    self.recording_status = "⚪"
+                    
                     # Сохраняем клип
-                    elapsed = datetime.now() - self.current_clip_start
-                    hours = elapsed.seconds // 3600
-                    minutes = (elapsed.seconds % 3600) // 60
-                    seconds = elapsed.seconds % 60
-                    hundredths = int(elapsed.microseconds / 10000)
+                    if self.record_start_time:
+                        elapsed = datetime.now() - self.record_start_time
+                        hours = elapsed.seconds // 3600
+                        minutes = (elapsed.seconds % 3600) // 60
+                        seconds = elapsed.seconds % 60
+                        frames = int((elapsed.microseconds / 1000000) * self.values['fps'])
+                        
+                        clip_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
+                        self.clips.append(clip_duration)
+                        
+                        # Ограничиваем историю
+                        if len(self.clips) > 10:
+                            self.clips.pop(0)
+                        
+                        print(f"[INFO] Запись завершена. Длительность: {clip_duration}")
                     
-                    clip_duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}:{hundredths:02d}"
-                    self.clips.append(clip_duration)
-                    
-                    # Ограничиваем историю
-                    if len(self.clips) > 10:
-                        self.clips.pop(0)
-                    
-                    self.current_clip_start = None
+                    self.record_start_time = None
+                    self.last_frame_time = None
         
         # Оставшееся время (09:02)
         elif category == 0x09 and subcategory == 0x02:
@@ -311,27 +443,33 @@ class CameraMonitor:
         
         # Выдержка (01:0C)
         elif category == 0x01 and subcategory == 0x0C:
-            self.values['shutter'] = value_human.replace('Выдержка: ', '')
+            if "Выдержка:" in value_human:
+                self.values['shutter'] = value_human.replace('Выдержка: ', '')
         
         # ISO (01:0E)
         elif category == 0x01 and subcategory == 0x0E:
-            self.values['iso'] = value_human.replace('ISO ', '')
+            if "ISO " in value_human:
+                self.values['iso'] = value_human.replace('ISO ', 'ISO ')
         
         # Диафрагма (0C:0A)
         elif category == 0x0C and subcategory == 0x0A:
-            self.values['aperture'] = value_human.replace('Диафрагма: ', '')
+            if "Диафрагма:" in value_human:
+                self.values['aperture'] = value_human.replace('Диафрагма: ', '')
         
         # Зум (0C:0B)
         elif category == 0x0C and subcategory == 0x0B:
-            self.values['zoom'] = value_human.replace('Зум: ', '')
+            if "Зум:" in value_human:
+                self.values['zoom'] = value_human.replace('Зум: ', '')
         
         # Фокус (0C:0C)
         elif category == 0x0C and subcategory == 0x0C:
-            self.values['focus'] = value_human.replace('Фокус: ', '')
+            if "Фокус:" in value_human:
+                self.values['focus'] = value_human.replace('Фокус: ', '')
         
         # Название объектива (0C:09)
         elif category == 0x0C and subcategory == 0x09:
-            self.values['lens'] = value_human.replace('Объектив: ', '')
+            if "Объектив:" in value_human:
+                self.values['lens'] = value_human.replace('Объектив: ', '')
 
 async def keyboard_handler(monitor):
     """Обработчик клавиатуры"""
@@ -366,8 +504,10 @@ async def keyboard_handler(monitor):
             elif key == 'c':
                 monitor.clear_screen()
                 print("\n🧹 Screen cleared")
-            elif key == 'f':
-                print("\n🎯 FPS toggle not implemented yet")
+            elif key == 'd':
+                monitor.debug_tc = not monitor.debug_tc
+                status = "ON" if monitor.debug_tc else "OFF"
+                print(f"\n🔧 TC Debug: {status}")
             
         except Exception:
             continue
@@ -377,7 +517,7 @@ async def main():
     monitor = CameraMonitor()
     
     print("=" * 62)
-    print("🎬 BLACKMAGIC CAMERA MONITOR v4.0")
+    print("🎬 BLACKMAGIC CAMERA MONITOR v4.0 - FIXED VERSION")
     print("=" * 62)
     print(f"Camera: {CAMERA_ADDRESS[:17]}...")
     print(f"Start: {datetime.now().strftime('%H:%M:%S')}")
@@ -396,8 +536,10 @@ async def main():
                 try:
                     parsed = parse_bmpcc_message(data)
                     monitor.handle_message(parsed, data)
-                except Exception:
-                    pass
+                except Exception as e:
+                    if monitor.debug_tc:
+                        print(f"[ERROR] Failed to parse: {e}")
+                        print(f"[ERROR] Raw data: {data.hex()}")
             
             # Подписываемся на оба канала
             await client.start_notify(UUID_NOTIFICATIONS, handle_notification)
@@ -405,6 +547,7 @@ async def main():
             
             print("✅ Connected to camera!")
             print("📡 Receiving data...")
+            print("💡 Press [D] to toggle TC debug mode")
             
             await asyncio.sleep(1)
             
@@ -415,6 +558,8 @@ async def main():
             try:
                 while True:
                     if not monitor.paused:
+                        # Обновляем таймкод на основе времени
+                        monitor.update_timecode()
                         monitor.draw_dashboard()
                     
                     if keyboard_task.done():

@@ -1,17 +1,58 @@
 """
-Декодер кодов в читаемые значения для Blackmagic Pocket Cinema Camera
+Декодер кодов в читаемые значения для Blackmagic Pocket Cinema Camera v.0.1 
 """
 
-from . import tables
+from . import constants, tables
+
+def decode_timecode_bcd(raw_bytes: bytes) -> dict:
+    """
+    Декодирует 32-bit BCD таймкод в формате HH:MM:SS:FF
+    Согласно BlueMagic32: порядок байтов КАДРЫ:СЕКУНДЫ:МИНУТЫ:ЧАСЫ
+    
+    Пример: 29040000 = 00:04:00:29 (29 кадров, 04 секунды, 00 минут, 00 часов)
+    """
+    if len(raw_bytes) < 4:
+        return {"hhmmssff": "—", "hh": 0, "mm": 0, "ss": 0, "ff": 0}
+    
+    # Порядок байтов из BlueMagic32: байты[0]=кадры, [1]=секунды, [2]=минуты, [3]=часы
+    f = (raw_bytes[0] >> 4) * 10 + (raw_bytes[0] & 0x0F)  # кадры
+    S = (raw_bytes[1] >> 4) * 10 + (raw_bytes[1] & 0x0F)  # секунды
+    M = (raw_bytes[2] >> 4) * 10 + (raw_bytes[2] & 0x0F)  # минуты
+    H = (raw_bytes[3] >> 4) * 10 + (raw_bytes[3] & 0x0F)  # часы
+    
+    # Форматируем строки
+    timecode_hhmmssff = f"{H:02d}:{M:02d}:{S:02d}:{f:02d}"
+    
+    # Автоматически определяем FPS по максимальному значению кадров
+    if f <= 24:
+        fps = 25
+    elif f <= 29:
+        fps = 30
+    elif f <= 49:
+        fps = 50
+    else:
+        fps = 60
+    
+    return {
+        "hhmmssff": timecode_hhmmssff,
+        "hh": H,
+        "mm": M, 
+        "ss": S,
+        "ff": f,
+        "raw_hex": raw_bytes.hex().upper(),
+        "fps": fps,
+        "frames": f
+    }
 
 def decode_shutter(raw_bytes: bytes) -> str:
     """
     Декодирует байты выдержки в читаемый вид (1/50, 1/100 и т.д.)
+    Формат: little-endian 32-bit значение
     """
     if len(raw_bytes) < 4:
         return f"Недостаточно данных: {raw_bytes.hex()}"
     
-    # Конвертируем байты в число (little-endian)
+    # Конвертируем байты в число (little-endian) - ВАЖНО!
     code = int.from_bytes(raw_bytes[:4], 'little')
     
     # Ищем в таблице известных значений
@@ -20,9 +61,9 @@ def decode_shutter(raw_bytes: bytes) -> str:
     
     # Пробуем вычислить выдержку из кода
     if code == 0:
-        return "Выдержка ???"
+        return "1/???"
     
-    # Экспериментальная формула
+    # Формула для выдержки (экспериментальная)
     shutter_sec = code / 173650.0
     
     # Конвертируем в дробь 1/XXX
@@ -283,10 +324,13 @@ def decode_value(category: int, subcategory: int, raw_bytes: bytes) -> str:
     
     # Категория 0x01 - Камера
     elif category == constants.CATEGORY_CAMERA:
-        if subcategory in [constants.SUBCAT_ISO_HIGH, constants.SUBCAT_ISO_LOW]:
-            return decode_iso(raw_bytes)
-        elif subcategory == 0x0D:
-            return decode_battery(raw_bytes)
+         if subcategory in [constants.SUBCAT_ISO_HIGH, constants.SUBCAT_ISO_LOW]:
+             return decode_iso(raw_bytes)
+         elif subcategory == 0x0C:  # Выдержка (основная)
+        # Декодируем как выдержку, а не ISO!
+             return decode_shutter(raw_bytes)
+         elif subcategory == 0x0D:
+             return decode_battery(raw_bytes)
     
     # Категория 0x0C - Объектив
     elif category == constants.CATEGORY_LENS:
