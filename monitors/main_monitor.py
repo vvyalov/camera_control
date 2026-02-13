@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-🎬 BLACKMAGIC CAMERA MONITOR v0.1 - FIXED VERSION
+🎬 BLACKMAGIC CAMERA MONITOR v4.0 - FIXED VERSION
 Профессиональный двухколоночный layout с исправленным таймкодом
 """
 

@@ -11,7 +11,7 @@ from collections import deque
 from bleak import BleakClient, BleakScanner
 import signal
 
-CAMERA_UUID = "EFBF6DD4-6058-CF36-1421-68F5AECB6CAA"
+CAMERA_UUID = "E7D0FD32-5393-2B54-61EE-F21174E0D7B0"
 
 class ExtendedCameraDashboard:
     def __init__(self):
@@ -495,9 +495,6 @@ class ExtendedCameraDashboard:
         
         # Output settings
         row = 16
-        if self.overlay_enables:
-            sys.stdout.write(f"\033[{row};44H  Overlays: {self.overlay_enables}")
-            row += 1
         if self.frame_guides_style:
             sys.stdout.write(f"\033[{row};44H  Guides:   {self.frame_guides_style}")
             row += 1
